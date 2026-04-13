@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -123,11 +125,338 @@ func fetchDistrictNodes(ctx context.Context, client *http.Client, token, authori
 	return nil, url1, err1
 }
 
+func loadFailedReport(path string) (failedReport, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return failedReport{}, fmt.Errorf("failed.json 路径为空")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return failedReport{}, err
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return failedReport{}, fmt.Errorf("failed.json 内容为空: %s", path)
+	}
+	var fr failedReport
+	if err := json.Unmarshal(b, &fr); err != nil {
+		return failedReport{}, err
+	}
+	// Treat empty lists as valid; caller may still want deterministic outputs.
+	if fr.FailedProvinces == nil {
+		fr.FailedProvinces = make([]failedProvince, 0)
+	}
+	if fr.FailedCities == nil {
+		fr.FailedCities = make([]failedCity, 0)
+	}
+	return fr, nil
+}
+
+func retryFromFailed(ctx context.Context, token string, cookies []*network.Cookie, gatewayHeaders map[string]string, fr failedReport) ([]ProvinceLoc, failedReport, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, failedReport{}, fmt.Errorf("缺少可用 token，无法重试地区接口")
+	}
+
+	client := &http.Client{Timeout: 90 * time.Second}
+	const minRequestInterval = 900 * time.Millisecond
+	const maxRequestInterval = 1800 * time.Millisecond
+
+	authorizationKey := strings.TrimSpace(gatewayHeaders["authorization_key"])
+	if authorizationKey == "" {
+		authorizationKey = strings.TrimSpace(gatewayHeaders["Authorization_Key"])
+	}
+	if authorizationKey == "" {
+		authorizationKey = findCookieValue(cookies, "authorization_key")
+	}
+
+	retryFailed := failedReport{
+		FailedProvinces: make([]failedProvince, 0),
+		FailedCities:    make([]failedCity, 0),
+	}
+
+	// Merge into a single "subset" output.
+	provByCode := make(map[string]*ProvinceLoc)
+	cityByProv := make(map[string]map[string]*CityLoc) // provCode -> cityCode -> *CityLoc
+
+	getOrCreateProvince := func(provName, provCode string) *ProvinceLoc {
+		if provCode == "" {
+			// Fallback to name key, but prefer codes when present.
+			provCode = provName
+		}
+		if p, ok := provByCode[provCode]; ok {
+			if p.Province == "" && provName != "" {
+				p.Province = provName
+			}
+			if p.ProvinceCode == "" && provCode != "" {
+				p.ProvinceCode = provCode
+			}
+			return p
+		}
+		p := &ProvinceLoc{
+			Province:     provName,
+			ProvinceCode: provCode,
+			Cities:       make([]*CityLoc, 0),
+		}
+		provByCode[provCode] = p
+		cityByProv[provCode] = make(map[string]*CityLoc)
+		return p
+	}
+
+	addOrMergeCity := func(prov *ProvinceLoc, city *CityLoc) {
+		if prov == nil || city == nil {
+			return
+		}
+		provCode := prov.ProvinceCode
+		if provCode == "" {
+			provCode = prov.Province
+		}
+		if _, ok := cityByProv[provCode]; !ok {
+			cityByProv[provCode] = make(map[string]*CityLoc)
+		}
+		cKey := city.CityCode
+		if cKey == "" {
+			cKey = city.City
+		}
+		if existing, ok := cityByProv[provCode][cKey]; ok {
+			// Prefer non-empty districts over empty ones.
+			if len(existing.Districts) == 0 && len(city.Districts) > 0 {
+				existing.Districts = city.Districts
+			}
+			if existing.City == "" && city.City != "" {
+				existing.City = city.City
+			}
+			if existing.CityCode == "" && city.CityCode != "" {
+				existing.CityCode = city.CityCode
+			}
+			return
+		}
+		prov.Cities = append(prov.Cities, city)
+		cityByProv[provCode][cKey] = city
+	}
+
+	// Track provinces where city list fetch succeeded, so we can skip duplicate per-city retries.
+	provinceCitiesFetched := make(map[string]bool)
+
+	// 1) Retry failed provinces: fetch their city list, then districts.
+	for _, fp := range fr.FailedProvinces {
+		provCode := strings.TrimSpace(fp.ProvinceCode)
+		provName := strings.TrimSpace(fp.Province)
+		prov := getOrCreateProvince(provName, provCode)
+
+		if provCode == "" {
+			retryFailed.FailedProvinces = append(retryFailed.FailedProvinces, failedProvince{
+				Province:     provName,
+				ProvinceCode: provCode,
+				URL:          "",
+				Error:        "missing ProvinceCode",
+			})
+			continue
+		}
+
+		provinceURL := "https://gateway.ccopyright.com.cn/userServer/area/city/" + provCode + "/1"
+		cities, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, provinceURL)
+		if err != nil {
+			retryFailed.FailedProvinces = append(retryFailed.FailedProvinces, failedProvince{
+				Province:     provName,
+				ProvinceCode: provCode,
+				URL:          provinceURL,
+				Error:        err.Error(),
+			})
+			continue
+		}
+		provinceCitiesFetched[provCode] = true
+		sleepHuman(ctx, minRequestInterval, maxRequestInterval)
+
+		for _, c := range cities {
+			city := &CityLoc{
+				City:      c.Name,
+				CityCode:  c.ID,
+				Districts: make([]*DistrictLoc, 0),
+			}
+
+			if isMunicipality(provName) {
+				// For municipalities, we keep Districts empty.
+				addOrMergeCity(prov, city)
+				continue
+			}
+
+			districts, usedURL, err := fetchDistrictNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, c.ID)
+			if err != nil {
+				retryFailed.FailedCities = append(retryFailed.FailedCities, failedCity{
+					Province:     provName,
+					ProvinceCode: provCode,
+					City:         c.Name,
+					CityCode:     c.ID,
+					URL:          usedURL,
+					Error:        err.Error(),
+				})
+				continue
+			}
+			sleepHuman(ctx, minRequestInterval, maxRequestInterval)
+
+			if len(districts) == 0 {
+				retryFailed.FailedCities = append(retryFailed.FailedCities, failedCity{
+					Province:     provName,
+					ProvinceCode: provCode,
+					City:         c.Name,
+					CityCode:     c.ID,
+					URL:          usedURL,
+					Error:        "empty districts",
+				})
+				continue
+			}
+
+			city.Districts = make([]*DistrictLoc, 0, len(districts))
+			for _, d := range districts {
+				city.Districts = append(city.Districts, &DistrictLoc{
+					District:     d.Name,
+					DistrictCode: d.ID,
+				})
+			}
+			addOrMergeCity(prov, city)
+		}
+	}
+
+	// 2) Retry failed cities: fetch their district list only.
+	for _, fc := range fr.FailedCities {
+		provCode := strings.TrimSpace(fc.ProvinceCode)
+		provName := strings.TrimSpace(fc.Province)
+		if provinceCitiesFetched[provCode] {
+			// Province retry already attempted all cities (best-effort), avoid extra duplicate calls.
+			continue
+		}
+		if isMunicipality(provName) {
+			// No district layer to backfill for municipalities.
+			continue
+		}
+
+		prov := getOrCreateProvince(provName, provCode)
+
+		cityCode := strings.TrimSpace(fc.CityCode)
+		cityName := strings.TrimSpace(fc.City)
+		if cityCode == "" {
+			retryFailed.FailedCities = append(retryFailed.FailedCities, failedCity{
+				Province:     provName,
+				ProvinceCode: provCode,
+				City:         cityName,
+				CityCode:     cityCode,
+				URL:          "",
+				Error:        "missing CityCode",
+			})
+			continue
+		}
+		districts, usedURL, err := fetchDistrictNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, cityCode)
+		if err != nil {
+			retryFailed.FailedCities = append(retryFailed.FailedCities, failedCity{
+				Province:     provName,
+				ProvinceCode: provCode,
+				City:         cityName,
+				CityCode:     cityCode,
+				URL:          usedURL,
+				Error:        err.Error(),
+			})
+			continue
+		}
+		sleepHuman(ctx, minRequestInterval, maxRequestInterval)
+
+		if len(districts) == 0 {
+			retryFailed.FailedCities = append(retryFailed.FailedCities, failedCity{
+				Province:     provName,
+				ProvinceCode: provCode,
+				City:         cityName,
+				CityCode:     cityCode,
+				URL:          usedURL,
+				Error:        "empty districts",
+			})
+			continue
+		}
+
+		city := &CityLoc{
+			City:      cityName,
+			CityCode:  cityCode,
+			Districts: make([]*DistrictLoc, 0, len(districts)),
+		}
+		for _, d := range districts {
+			city.Districts = append(city.Districts, &DistrictLoc{
+				District:     d.Name,
+				DistrictCode: d.ID,
+			})
+		}
+		addOrMergeCity(prov, city)
+	}
+
+	// Finalize: convert map to slice and sort for stable output.
+	out := make([]ProvinceLoc, 0, len(provByCode))
+	for _, p := range provByCode {
+		if p == nil || len(p.Cities) == 0 {
+			continue
+		}
+		sort.Slice(p.Cities, func(i, j int) bool {
+			ci, cj := p.Cities[i], p.Cities[j]
+			ki, kj := "", ""
+			if ci != nil {
+				ki = ci.CityCode
+				if ki == "" {
+					ki = ci.City
+				}
+			}
+			if cj != nil {
+				kj = cj.CityCode
+				if kj == "" {
+					kj = cj.City
+				}
+			}
+			return ki < kj
+		})
+		for _, c := range p.Cities {
+			if c == nil || len(c.Districts) == 0 {
+				continue
+			}
+			sort.Slice(c.Districts, func(i, j int) bool {
+				di, dj := c.Districts[i], c.Districts[j]
+				ki, kj := "", ""
+				if di != nil {
+					ki = di.DistrictCode
+					if ki == "" {
+						ki = di.District
+					}
+				}
+				if dj != nil {
+					kj = dj.DistrictCode
+					if kj == "" {
+						kj = dj.District
+					}
+				}
+				return ki < kj
+			})
+		}
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		pi, pj := out[i], out[j]
+		ki, kj := pi.ProvinceCode, pj.ProvinceCode
+		if ki == "" {
+			ki = pi.Province
+		}
+		if kj == "" {
+			kj = pj.Province
+		}
+		return ki < kj
+	})
+
+	return out, retryFailed, nil
+}
+
 func main() {
+	retryPath := flag.String("retry", "", "path to failed.json; if provided, run retry mode and output subset results")
+	retryOutPath := flag.String("retry-out", "retry_output.json", "output file path for retry subset results")
+	retryFailedOutPath := flag.String("retry-failed-out", "retry_failed.json", "output file path for retry failures")
+	flag.Parse()
+
 	// 1. 设置目标 URL 和凭证
 	loginURL := "https://register.ccopyright.com.cn/login.html"
-	username := "15901192494"
-	password := "Zxl1234567890"
+	username := "YOUR_USERNAME"
+	password := "YOUR_PASSWORD"
 
 	// 2. 初始化浏览器配置，设置为非无头模式以便调试查看，以及人工过验证码
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -375,6 +704,48 @@ func main() {
 	}))
 	if err != nil {
 		log.Fatalf("获取浏览器 Cookies 失败: %v", err)
+	}
+
+	if strings.TrimSpace(*retryPath) != "" {
+		fr, err := loadFailedReport(*retryPath)
+		if err != nil {
+			log.Fatalf("读取 failed.json 失败: %v", err)
+		}
+		retryData, retryFailed, err := retryFromFailed(ctx, extractedToken, browserCookies, gatewayHeaders, fr)
+		if err != nil {
+			log.Printf("重试过程中存在错误(将继续写出已成功补齐的数据): %v", err)
+		}
+
+		out, err := json.MarshalIndent(retryData, "", "  ")
+		if err != nil {
+			log.Fatalf("retry_output.json 序列化失败: %v", err)
+		}
+		if err := os.WriteFile(*retryOutPath, out, 0644); err != nil {
+			log.Fatalf("写入重试结果文件失败: %v", err)
+		}
+
+		failedOut, err := json.MarshalIndent(retryFailed, "", "  ")
+		if err != nil {
+			log.Printf("retry_failed.json 序列化失败(将跳过输出): %v", err)
+		} else {
+			if err := os.WriteFile(*retryFailedOutPath, failedOut, 0644); err != nil {
+				log.Printf("写入重试失败列表文件失败(将跳过输出): %v", err)
+			}
+		}
+
+		// Print summary.
+		cityCount := 0
+		for _, p := range retryData {
+			cityCount += len(p.Cities)
+		}
+		fmt.Printf("重试补齐结果已写入: %s\n", *retryOutPath)
+		fmt.Printf("补齐省份: %d, 补齐城市: %d\n", len(retryData), cityCount)
+		fmt.Printf("重试仍失败省份: %d, 仍失败城市: %d\n", len(retryFailed.FailedProvinces), len(retryFailed.FailedCities))
+		if strings.TrimSpace(*retryFailedOutPath) != "" {
+			fmt.Printf("重试失败列表已写入: %s\n", *retryFailedOutPath)
+		}
+		fmt.Println("任务结束。")
+		return
 	}
 
 	rawJSON, failed, err := fetchAllAreaRawJSON(ctx, extractedToken, browserCookies, gatewayHeaders)

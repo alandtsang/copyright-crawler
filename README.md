@@ -23,6 +23,7 @@
 - 复用登录态中的请求头、`authorization_key` 和 Cookie 调用地区接口。
 - 输出整理后的三级地区 JSON 数据到 `output.json` 文件。
 - 在页面结构变化时导出调试 HTML，便于后续排查。
+- 支持基于 `failed.json` 的失败项重试，输出补齐子集与新失败列表。
 
 ## 运行环境
 
@@ -42,7 +43,7 @@
 
 ### 1. 配置账号
 
-编辑 [`main.go`](main.go)，替换登录凭证：
+编辑 [`main.go`](main.go)，设置登录凭证（当前为硬编码变量）：
 
 ```go
 loginURL := "https://register.ccopyright.com.cn/login.html"
@@ -50,7 +51,10 @@ username := "YOUR_USERNAME"
 password := "YOUR_PASSWORD"
 ```
 
-当前代码中账号密码仍为占位符，必须手动替换后才能运行。
+注意：
+
+- 请勿将真实账号密码提交到版本库。
+- 若后续需要更安全的方式（环境变量/命令行参数），可再做拆分。
 
 ### 2. 安装依赖
 
@@ -66,6 +70,26 @@ go run main.go
 
 运行完成后，程序会在项目根目录生成或覆盖 `output.json`，终端只打印结果文件路径、数据条数和完成提示。
 
+### 4. 重试 failed.json（补齐子集输出）
+
+当全量抓取生成了 `failed.json`（包含失败的省份/城市）后，可以用重试模式对失败项再次获取：
+
+```bash
+go run main.go -retry failed.json -retry-out retry_output.json -retry-failed-out retry_failed.json
+```
+
+说明：
+
+- `retry_output.json` 只包含本次重试成功补齐的数据子集（不会输出全量数据，也不会自动合并进旧的 `output.json`）。
+- `retry_failed.json` 会记录本次重试仍失败的条目，可用于继续多轮重试。
+- 重试模式不会生成/覆盖 `output.json` 与 `failed.json`，仅产出本轮的 `retry_output.json` 与 `retry_failed.json`。
+
+多轮重试示例（把上一轮的 `retry_failed.json` 作为下一轮输入）：
+
+```bash
+go run main.go -retry retry_failed.json -retry-out retry_output_2.json -retry-failed-out retry_failed_2.json
+```
+
 ## 运行流程
 
 1. 程序以非无头模式启动浏览器并打开登录页。
@@ -78,6 +102,13 @@ go run main.go
    - 省份接口：`/userServer/area/province/001`
    - 城市/区县接口：`/userServer/area/city/{id}/1`
 8. 程序将接口返回结果转换为统一结构，写入项目根目录的 `output.json`。
+
+## 输出文件
+
+- `output.json`：全量抓取的最终省/市/区（县）结构化数据。
+- `failed.json`：全量抓取过程中失败的省份/城市列表（用于后续重试）。
+- `retry_output.json`（可配置）：重试模式本轮补齐成功的数据子集。
+- `retry_failed.json`（可配置）：重试模式本轮仍失败的省份/城市列表（用于下一轮重试）。
 
 ## 输出示例
 
@@ -123,7 +154,7 @@ go run main.go
 - 当前“软件名称”和“版本号”步骤写入的是固定测试值：
   - 软件全称：`测试测试`
   - 版本号：`1.0.0`
-- 项目暂未拆分配置文件、命令行参数或独立测试用例，整体仍属于单文件脚本形态。
+- 项目暂未拆分配置文件或独立测试用例，整体仍属于单文件脚本形态。
 
 ## 后续可改进项
 
