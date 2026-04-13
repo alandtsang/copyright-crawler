@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
+
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // ProvinceLoc 省份层级
 type ProvinceLoc struct {
@@ -66,11 +69,65 @@ type areaNode struct {
 	HasChildren int    `json:"hasChildren"`
 }
 
+type failedProvince struct {
+	Province     string `json:"Province"`
+	ProvinceCode string `json:"ProvinceCode"`
+	URL          string `json:"URL"`
+	Error        string `json:"Error"`
+}
+
+type failedCity struct {
+	Province     string `json:"Province"`
+	ProvinceCode string `json:"ProvinceCode"`
+	City         string `json:"City"`
+	CityCode     string `json:"CityCode"`
+	URL          string `json:"URL"`
+	Error        string `json:"Error"`
+}
+
+type failedReport struct {
+	FailedProvinces []failedProvince `json:"FailedProvinces"`
+	FailedCities    []failedCity     `json:"FailedCities"`
+}
+
+func isMunicipality(provinceName string) bool {
+	switch strings.TrimSpace(provinceName) {
+	case "北京", "北京市", "上海", "上海市", "天津", "天津市", "重庆", "重庆市":
+		return true
+	default:
+		return false
+	}
+}
+
+func fetchDistrictNodes(ctx context.Context, client *http.Client, token, authorizationKey string, cookies []*network.Cookie, gatewayHeaders map[string]string, cityID string) ([]areaNode, string, error) {
+	// The last path segment is an API "level" parameter which varies across deployments.
+	// Empirically, districts are often under ".../area/{cityID}/1" (not ".../city/{cityID}/...").
+	// Cities are under ".../city/{provinceID}/1".
+	base := "https://gateway.ccopyright.com.cn/userServer/area/area/" + cityID + "/"
+
+	// Try level=2 first, then fall back to level=1.
+	url2 := base + "2"
+	nodes, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, url2)
+	if err == nil && len(nodes) > 0 {
+		return nodes, url2, nil
+	}
+
+	// If level=2 yields empty or error, try level=1.
+	url1 := base + "1"
+	nodes1, err1 := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, url1)
+	if err1 == nil {
+		return nodes1, url1, nil
+	}
+
+	// Prefer the fallback error if it fails too; otherwise surface the original.
+	return nil, url1, err1
+}
+
 func main() {
 	// 1. 设置目标 URL 和凭证
 	loginURL := "https://register.ccopyright.com.cn/login.html"
-	username := "YOUR_USERNAME"
-	password := "YOUR_PASSWORD"
+	username := "15901192494"
+	password := "Zxl1234567890"
 
 	// 2. 初始化浏览器配置，设置为非无头模式以便调试查看，以及人工过验证码
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -320,14 +377,18 @@ func main() {
 		log.Fatalf("获取浏览器 Cookies 失败: %v", err)
 	}
 
-	rawJSON, err := fetchAllAreaRawJSON(ctx, extractedToken, browserCookies, gatewayHeaders)
+	rawJSON, failed, err := fetchAllAreaRawJSON(ctx, extractedToken, browserCookies, gatewayHeaders)
 	if err != nil {
-		log.Fatalf("获取原始 JSON 失败: %v", err)
+		// Best-effort: still try to parse/write whatever we have, even if incomplete.
+		log.Printf("获取原始 JSON 过程中存在错误(将继续输出不完整数据): %v", err)
 	}
 
 	finalData, err := parseAndPrintData(rawJSON)
 	if err != nil {
-		log.Fatalf("转换省市区数据失败: %v", err)
+		// If parsing failed (e.g. rawJSON empty), still write an empty output.json
+		// so caller has a deterministic artifact to inspect.
+		log.Printf("转换省市区数据失败(将输出空数据): %v", err)
+		finalData = make([]ProvinceLoc, 0)
 	}
 
 	// 将最终 JSON 写入项目根目录，避免大结果刷屏终端。
@@ -338,6 +399,20 @@ func main() {
 	const outputFile = "output.json"
 	if err := os.WriteFile(outputFile, out, 0644); err != nil {
 		log.Fatalf("写入结果文件失败: %v", err)
+	}
+
+	// Also write failures for retry runs.
+	failedOut, err := json.MarshalIndent(failed, "", "  ")
+	if err != nil {
+		log.Printf("failed.json 序列化失败(将跳过输出): %v", err)
+	} else {
+		const failedFile = "failed.json"
+		if err := os.WriteFile(failedFile, failedOut, 0644); err != nil {
+			log.Printf("写入失败列表文件失败(将跳过输出): %v", err)
+		} else {
+			fmt.Printf("失败列表已写入: %s\n", failedFile)
+			fmt.Printf("失败省份: %d, 失败城市: %d\n", len(failed.FailedProvinces), len(failed.FailedCities))
+		}
 	}
 
 	fmt.Printf("结果已写入: %s\n", outputFile)
@@ -392,14 +467,17 @@ func parseAndPrintData(body []byte) ([]ProvinceLoc, error) {
 	return result, nil
 }
 
-func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.Cookie, gatewayHeaders map[string]string) ([]byte, error) {
+func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.Cookie, gatewayHeaders map[string]string) ([]byte, failedReport, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return nil, fmt.Errorf("缺少可用 token，无法请求地区接口")
+		return nil, failedReport{}, fmt.Errorf("缺少可用 token，无法请求地区接口")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	const requestInterval = 200 * time.Millisecond
+	// Allow slower responses; we also have retries/backoff below.
+	client := &http.Client{Timeout: 90 * time.Second}
+	// Gateway side is sensitive to burst traffic; mimic human pacing with jitter.
+	const minRequestInterval = 900 * time.Millisecond
+	const maxRequestInterval = 1800 * time.Millisecond
 	authorizationKey := strings.TrimSpace(gatewayHeaders["authorization_key"])
 	if authorizationKey == "" {
 		authorizationKey = strings.TrimSpace(gatewayHeaders["Authorization_Key"])
@@ -408,14 +486,22 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 		authorizationKey = findCookieValue(cookies, "authorization_key")
 	}
 
+	failed := failedReport{
+		FailedProvinces: make([]failedProvince, 0),
+		FailedCities:    make([]failedCity, 0),
+	}
+
 	provinces, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/province/001")
 	if err != nil {
-		return nil, fmt.Errorf("获取省份失败: %w", err)
+		// Still return a valid JSON array so caller can write output.json.
+		return []byte("[]"), failed, fmt.Errorf("获取省份失败: %w", err)
 	}
-	time.Sleep(requestInterval)
+	sleepHuman(ctx, minRequestInterval, maxRequestInterval)
 
+	var partialErr error
 	raw := make([]rawProvinceLoc, 0, len(provinces))
 	for _, p := range provinces {
+		provinceURL := "https://gateway.ccopyright.com.cn/userServer/area/city/" + p.ID + "/1"
 		prov := rawProvinceLoc{
 			Province:     p.Name,
 			ProvinceCode: p.ID,
@@ -423,11 +509,23 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 		}
 
 		if p.HasChildren == 1 {
-			cities, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/city/"+p.ID+"/1")
+			cities, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, provinceURL)
 			if err != nil {
-				return nil, fmt.Errorf("获取省份 %s(%s) 下城市失败: %w", p.Name, p.ID, err)
+				// Best-effort: don't abort the whole crawl if one province's cities fail.
+				log.Printf("获取省份 %s(%s) 下城市失败，跳过该省城市/区县: %v", p.Name, p.ID, err)
+				failed.FailedProvinces = append(failed.FailedProvinces, failedProvince{
+					Province:     p.Name,
+					ProvinceCode: p.ID,
+					URL:          provinceURL,
+					Error:        err.Error(),
+				})
+				if partialErr == nil {
+					partialErr = fmt.Errorf("获取省份 %s(%s) 下城市失败: %w", p.Name, p.ID, err)
+				}
+				raw = append(raw, prov)
+				continue
 			}
-			time.Sleep(requestInterval)
+			sleepHuman(ctx, minRequestInterval, maxRequestInterval)
 
 			prov.Cities = make([]rawCityLoc, 0, len(cities))
 			for _, c := range cities {
@@ -437,20 +535,54 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 					Districts: make([]rawDistrictLoc, 0),
 				}
 
-				if c.HasChildren == 1 {
-					districts, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/city/"+c.ID+"/1")
-					if err != nil {
-						return nil, fmt.Errorf("获取城市 %s(%s) 下区县失败: %w", c.Name, c.ID, err)
-					}
-					time.Sleep(requestInterval)
+				// Direct-controlled municipalities have only province+city in this dataset (no district layer).
+				if isMunicipality(p.Name) {
+					prov.Cities = append(prov.Cities, city)
+					continue
+				}
 
-					city.Districts = make([]rawDistrictLoc, 0, len(districts))
-					for _, d := range districts {
-						city.Districts = append(city.Districts, rawDistrictLoc{
-							District:     d.Name,
-							DistrictCode: d.ID,
-						})
+				// NOTE: area API's "hasChildren" on city nodes is not reliable in practice (often 0),
+				// but districts are still queryable; always attempt district fetch.
+				districts, usedURL, err := fetchDistrictNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, c.ID)
+				if err != nil {
+					// Best-effort: a subset of cities intermittently fails with 502; don't abort the whole crawl.
+					// Keep Districts empty for this city and continue.
+					log.Printf("获取城市 %s(%s) 下区县失败，跳过该城市区县: %v", c.Name, c.ID, err)
+					failed.FailedCities = append(failed.FailedCities, failedCity{
+						Province:     p.Name,
+						ProvinceCode: p.ID,
+						City:         c.Name,
+						CityCode:     c.ID,
+						URL:          usedURL,
+						Error:        err.Error(),
+					})
+					if partialErr == nil {
+						partialErr = fmt.Errorf("获取城市 %s(%s) 下区县失败: %w", c.Name, c.ID, err)
 					}
+					prov.Cities = append(prov.Cities, city)
+					continue
+				}
+				sleepHuman(ctx, minRequestInterval, maxRequestInterval)
+
+				if len(districts) == 0 {
+					// Treat "empty districts" as a failed item for later retry/backfill.
+					log.Printf("获取城市 %s(%s) 下区县为空(接口返回空列表)，保留空 Districts: %s", c.Name, c.ID, usedURL)
+					failed.FailedCities = append(failed.FailedCities, failedCity{
+						Province:     p.Name,
+						ProvinceCode: p.ID,
+						City:         c.Name,
+						CityCode:     c.ID,
+						URL:          usedURL,
+						Error:        "empty districts",
+					})
+				}
+
+				city.Districts = make([]rawDistrictLoc, 0, len(districts))
+				for _, d := range districts {
+					city.Districts = append(city.Districts, rawDistrictLoc{
+						District:     d.Name,
+						DistrictCode: d.ID,
+					})
 				}
 
 				prov.Cities = append(prov.Cities, city)
@@ -462,13 +594,14 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 
 	body, err := json.Marshal(raw)
 	if err != nil {
-		return nil, fmt.Errorf("序列化原始 JSON 失败: %w", err)
+		return nil, failed, fmt.Errorf("序列化原始 JSON 失败: %w", err)
 	}
-	return body, nil
+	return body, failed, partialErr
 }
 
 func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizationKey string, cookies []*network.Cookie, gatewayHeaders map[string]string, url string) ([]areaNode, error) {
-	const maxAttempts = 4
+	// Be conservative: longer retry window with exponential backoff + jitter to look less like a bot.
+	const maxAttempts = 8
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -507,7 +640,7 @@ func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizati
 			if attempt == maxAttempts || !shouldRetryAreaRequest(0, err) {
 				return nil, err
 			}
-			waitBeforeRetry(ctx, attempt)
+			waitBeforeRetry(ctx, attempt, nil)
 			continue
 		}
 
@@ -518,7 +651,7 @@ func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizati
 			if attempt == maxAttempts || !shouldRetryAreaRequest(0, readErr) {
 				return nil, readErr
 			}
-			waitBeforeRetry(ctx, attempt)
+			waitBeforeRetry(ctx, attempt, resp)
 			continue
 		}
 
@@ -532,7 +665,7 @@ func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizati
 				return nil, lastErr
 			}
 			fmt.Printf("地区接口请求失败，准备重试(%d/%d): %s\n", attempt, maxAttempts, url)
-			waitBeforeRetry(ctx, attempt)
+			waitBeforeRetry(ctx, attempt, resp)
 			continue
 		}
 
@@ -570,8 +703,27 @@ func shouldRetryAreaRequest(statusCode int, err error) bool {
 	}
 }
 
-func waitBeforeRetry(ctx context.Context, attempt int) {
-	delay := time.Duration(attempt) * time.Second
+func waitBeforeRetry(ctx context.Context, attempt int, resp *http.Response) {
+	// Honor Retry-After when present (common with 429).
+	if resp != nil {
+		if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+			if secs, err := time.ParseDuration(ra + "s"); err == nil && secs > 0 {
+				sleepWithContext(ctx, secs)
+				return
+			}
+		}
+	}
+
+	// Exponential backoff with jitter, capped.
+	// attempt=1 => ~2s, attempt=2 => ~4s, ...
+	const base = 2 * time.Second
+	const max = 60 * time.Second
+	delay := base << (attempt - 1)
+	if delay > max {
+		delay = max
+	}
+	// Add 0-1200ms jitter.
+	delay += time.Duration(rng.Int63n(int64(1200 * time.Millisecond)))
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
@@ -579,6 +731,37 @@ func waitBeforeRetry(ctx context.Context, attempt int) {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func sleepHuman(ctx context.Context, min, max time.Duration) {
+	if min <= 0 && max <= 0 {
+		return
+	}
+	if min <= 0 {
+		min = max
+	}
+	if max < min {
+		max = min
+	}
+	span := max - min
+	if span <= 0 {
+		sleepWithContext(ctx, min)
+		return
+	}
+	d := min + time.Duration(rng.Int63n(int64(span)+1))
+	sleepWithContext(ctx, d)
 }
 
 func findCookieValue(cookies []*network.Cookie, name string) string {

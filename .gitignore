@@ -33,3 +33,4 @@ go.work.sum
 .trae/
 
 output.json
+failed.json
