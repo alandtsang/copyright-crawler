@@ -35,7 +35,14 @@
 
 ## 项目文件
 
-- `main.go`：主程序，包含浏览器自动化、网络监听、接口请求和 JSON 转换逻辑。
+- `main.go`：程序入口（命令行参数解析、运行编排）。
+- `internal/`：核心实现代码（按职责拆分，便于维护与扩展）。
+  - `internal/browser/`：浏览器自动化登录、网络监听、Cookie/鉴权信息采集。
+  - `internal/areaapi/`：地区接口请求与重试、节流/退避策略。
+  - `internal/codec/`：原始 JSON 解析与结构转换。
+  - `internal/retry/`：`failed.json` 读取与重试输入处理。
+  - `internal/output/`：输出文件写入（`output.json` / `failed.json` / retry 输出）。
+  - `internal/model/`：数据结构定义（省/市/区县、失败项等）。
 - `README.md`：项目说明文档。
 - `go.mod` / `go.sum`：Go 依赖定义。
 
@@ -65,7 +72,7 @@ go mod tidy
 ### 3. 启动程序
 
 ```bash
-go run main.go
+go run .
 ```
 
 运行完成后，程序会在项目根目录生成或覆盖 `output.json`，终端只打印结果文件路径、数据条数和完成提示。
@@ -75,7 +82,7 @@ go run main.go
 当全量抓取生成了 `failed.json`（包含失败的省份/城市）后，可以用重试模式对失败项再次获取：
 
 ```bash
-go run main.go -retry failed.json -retry-out retry_output.json -retry-failed-out retry_failed.json
+go run . -retry failed.json -retry-out retry_output.json -retry-failed-out retry_failed.json
 ```
 
 说明：
@@ -87,7 +94,7 @@ go run main.go -retry failed.json -retry-out retry_output.json -retry-failed-out
 多轮重试示例（把上一轮的 `retry_failed.json` 作为下一轮输入）：
 
 ```bash
-go run main.go -retry retry_failed.json -retry-out retry_output_2.json -retry-failed-out retry_failed_2.json
+go run . -retry retry_failed.json -retry-out retry_output_2.json -retry-failed-out retry_failed_2.json
 ```
 
 ## 运行流程
