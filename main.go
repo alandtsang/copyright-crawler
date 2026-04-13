@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -31,6 +33,37 @@ type CityLoc struct {
 type DistrictLoc struct {
 	District     string `json:"District"`
 	DistrictCode string `json:"-"`
+}
+
+type rawProvinceLoc struct {
+	Province     string       `json:"Province"`
+	ProvinceCode string       `json:"ProvinceCode"`
+	Cities       []rawCityLoc `json:"Cities"`
+}
+
+type rawCityLoc struct {
+	City      string           `json:"City"`
+	CityCode  string           `json:"CityCode"`
+	Districts []rawDistrictLoc `json:"Districts"`
+}
+
+type rawDistrictLoc struct {
+	District     string `json:"District"`
+	DistrictCode string `json:"DistrictCode"`
+}
+
+type areaAPIResponse struct {
+	Code       int        `json:"code"`
+	Msg        string     `json:"msg"`
+	Message    string     `json:"message"`
+	ReturnCode string     `json:"returnCode"`
+	Data       []areaNode `json:"data"`
+}
+
+type areaNode struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	HasChildren int    `json:"hasChildren"`
 }
 
 func main() {
@@ -60,6 +93,7 @@ func main() {
 
 	// 在此处准备一个用于提取最终 token 的变量
 	var extractedToken string
+	gatewayHeaders := make(map[string]string)
 
 	// 3. 监听网络请求
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
@@ -67,11 +101,14 @@ func main() {
 		case *network.EventRequestWillBeSent:
 			// 拦截登录后的任意 API 请求，从请求头中窃取 token
 			if strings.Contains(ev.Request.URL, "gateway.ccopyright.com.cn") {
+				for key, value := range ev.Request.Headers {
+					gatewayHeaders[key] = fmt.Sprint(value)
+				}
 				if auth, ok := ev.Request.Headers["Authorization"]; ok {
-					extractedToken = auth.(string)
+					extractedToken = fmt.Sprint(auth)
 				}
 				if auth, ok := ev.Request.Headers["token"]; ok {
-					extractedToken = auth.(string)
+					extractedToken = fmt.Sprint(auth)
 				}
 			}
 		case *network.EventResponseReceived:
@@ -270,73 +307,27 @@ func main() {
 		fmt.Println("UI 操作完成！")
 	}
 
-	// 由于发现后端 API 是树状逐级请求的：
-	// 省份：https://gateway.ccopyright.com.cn/userServer/area/province/001
-	// 城市/区县：https://gateway.ccopyright.com.cn/userServer/area/city/{provinceId}/1
-	// (或者可能是 area/city/001011/1 包含城市，hasChildren 标志是否还有下一级)
-	// 我们将直接使用 chromedp 发起 fetch 请求获取完整树
-
-	var finalData []ProvinceLoc
-	err = chromedp.Run(ctx,
-		chromedp.EvaluateAsDevTools(`
-			(async function(token) {
-				const headers = {
-					'Content-Type': 'application/json',
-					'token': token,
-					'Authorization': token
-				};
-				
-				// 获取所有省份
-				const provResp = await fetch('https://gateway.ccopyright.com.cn/userServer/area/province/001', {headers});
-				const provData = await provResp.json();
-				const provinces = provData.data || [];
-				
-				let result = [];
-				for (let p of provinces) {
-					let provItem = {
-						Province: p.name,
-						ProvinceCode: p.id,
-						Cities: []
-					};
-					
-					// 如果该省份有子节点（市/区）
-					if (p.hasChildren === 1) {
-						const cityResp = await fetch('https://gateway.ccopyright.com.cn/userServer/area/city/' + p.id + '/1', {headers});
-						const cityData = await cityResp.json();
-						const cities = cityData.data || [];
-						
-						for (let c of cities) {
-							let cityItem = {
-								City: c.name,
-								CityCode: c.id,
-								Districts: []
-							};
-							
-							// 如果城市有区县，继续请求
-							if (c.hasChildren === 1) {
-								const distResp = await fetch('https://gateway.ccopyright.com.cn/userServer/area/city/' + c.id + '/1', {headers});
-								const distData = await distResp.json();
-								const dists = distData.data || [];
-								
-								for (let d of dists) {
-									cityItem.Districts.push({
-										District: d.name,
-										DistrictCode: d.id
-									});
-								}
-							}
-							provItem.Cities.push(cityItem);
-						}
-					}
-					result.push(provItem);
-				}
-				return result;
-			})('`+extractedToken+`')
-		`, &finalData),
-	)
-
+	var browserCookies []*network.Cookie
+	err = chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
+		var cookieErr error
+		browserCookies, cookieErr = network.GetCookies().WithURLs([]string{
+			loginURL,
+			"https://gateway.ccopyright.com.cn/",
+		}).Do(c)
+		return cookieErr
+	}))
 	if err != nil {
-		log.Fatalf("执行脚本获取数据失败: %v", err)
+		log.Fatalf("获取浏览器 Cookies 失败: %v", err)
+	}
+
+	rawJSON, err := fetchAllAreaRawJSON(ctx, extractedToken, browserCookies, gatewayHeaders)
+	if err != nil {
+		log.Fatalf("获取原始 JSON 失败: %v", err)
+	}
+
+	finalData, err := parseAndPrintData(rawJSON)
+	if err != nil {
+		log.Fatalf("转换省市区数据失败: %v", err)
 	}
 
 	// 输出最终 JSON
@@ -349,77 +340,232 @@ func main() {
 	fmt.Println("任务结束。")
 }
 
-// parseAndPrintData 解析并打印数据的占位符函数
-func parseAndPrintData(body []byte) {
-	// TODO: 由于缺少真实的 API 返回 JSON 结构，这里使用占位符逻辑。
-	// 请你根据下方打印的 `原始 JSON 数据片段`，修改此函数，
-	// 将原始数据反序列化，并映射到 []ProvinceLoc 结构中。
-
-	fmt.Println("=== 原始 JSON 数据片段 (前 500 个字符) ===")
-	if len(body) > 500 {
-		fmt.Println(string(body)[:500], "...")
-	} else {
-		fmt.Println(string(body))
+// parseAndPrintData 将抓取到的原始 JSON 转换为最终输出结构。
+func parseAndPrintData(body []byte) ([]ProvinceLoc, error) {
+	body = []byte(strings.TrimSpace(string(body)))
+	if len(body) == 0 {
+		return nil, fmt.Errorf("未获取到省市区原始 JSON")
 	}
-	fmt.Println("==========================================")
 
-	/*
-		// 示例映射逻辑：
+	var raw []rawProvinceLoc
+	if err := json.Unmarshal(body, &raw); err != nil {
+		preview := string(body)
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		return nil, fmt.Errorf("原始 JSON 解析失败: %w; 长度=%d; 片段=%q", err, len(body), preview)
+	}
 
-		// 1. 定义与 API 返回结构匹配的原始结构体
-		type RawResponse struct {
-			Code int `json:"code"`
-			Data []struct {
-				ProvName string `json:"prov_name"`
-				ProvCode string `json:"prov_code"`
-				CityList []struct {
-					CityName string `json:"city_name"`
-					CityCode string `json:"city_code"`
-					AreaList []struct {
-						AreaName string `json:"area_name"`
-						AreaCode string `json:"area_code"`
-					} `json:"area_list"`
-				} `json:"city_list"`
-			} `json:"data"`
+	result := make([]ProvinceLoc, 0, len(raw))
+	for _, p := range raw {
+		prov := ProvinceLoc{
+			Province:     p.Province,
+			ProvinceCode: p.ProvinceCode,
+			Cities:       make([]*CityLoc, 0, len(p.Cities)),
 		}
 
-		var raw RawResponse
-		if err := json.Unmarshal(body, &raw); err != nil {
-			fmt.Printf("解析 JSON 失败: %v\n", err)
-			return
-		}
-
-		// 2. 转换为目标 []ProvinceLoc 结构
-		var result []ProvinceLoc
-		for _, p := range raw.Data {
-			prov := ProvinceLoc{
-				Province:     p.ProvName,
-				ProvinceCode: p.ProvCode,
+		for _, c := range p.Cities {
+			city := &CityLoc{
+				City:      c.City,
+				CityCode:  c.CityCode,
+				Districts: make([]*DistrictLoc, 0, len(c.Districts)),
 			}
-			for _, c := range p.CityList {
-				city := &CityLoc{
-					City:     c.CityName,
-					CityCode: c.CityCode,
+
+			for _, d := range c.Districts {
+				city.Districts = append(city.Districts, &DistrictLoc{
+					District:     d.District,
+					DistrictCode: d.DistrictCode,
+				})
+			}
+
+			prov.Cities = append(prov.Cities, city)
+		}
+
+		result = append(result, prov)
+	}
+
+	return result, nil
+}
+
+func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.Cookie, gatewayHeaders map[string]string) ([]byte, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, fmt.Errorf("缺少可用 token，无法请求地区接口")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	authorizationKey := strings.TrimSpace(gatewayHeaders["authorization_key"])
+	if authorizationKey == "" {
+		authorizationKey = strings.TrimSpace(gatewayHeaders["Authorization_Key"])
+	}
+	if authorizationKey == "" {
+		authorizationKey = findCookieValue(cookies, "authorization_key")
+	}
+
+	provinces, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/province/001")
+	if err != nil {
+		return nil, fmt.Errorf("获取省份失败: %w", err)
+	}
+
+	raw := make([]rawProvinceLoc, 0, len(provinces))
+	for _, p := range provinces {
+		prov := rawProvinceLoc{
+			Province:     p.Name,
+			ProvinceCode: p.ID,
+			Cities:       make([]rawCityLoc, 0),
+		}
+
+		if p.HasChildren == 1 {
+			cities, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/city/"+p.ID+"/1")
+			if err != nil {
+				return nil, fmt.Errorf("获取省份 %s(%s) 下城市失败: %w", p.Name, p.ID, err)
+			}
+
+			prov.Cities = make([]rawCityLoc, 0, len(cities))
+			for _, c := range cities {
+				city := rawCityLoc{
+					City:      c.Name,
+					CityCode:  c.ID,
+					Districts: make([]rawDistrictLoc, 0),
 				}
-				for _, a := range c.AreaList {
-					dist := &DistrictLoc{
-						District:     a.AreaName,
-						DistrictCode: a.AreaCode,
+
+				if c.HasChildren == 1 {
+					districts, err := fetchAreaNodes(ctx, client, token, authorizationKey, cookies, gatewayHeaders, "https://gateway.ccopyright.com.cn/userServer/area/city/"+c.ID+"/1")
+					if err != nil {
+						return nil, fmt.Errorf("获取城市 %s(%s) 下区县失败: %w", c.Name, c.ID, err)
 					}
-					city.Districts = append(city.Districts, dist)
+
+					city.Districts = make([]rawDistrictLoc, 0, len(districts))
+					for _, d := range districts {
+						city.Districts = append(city.Districts, rawDistrictLoc{
+							District:     d.Name,
+							DistrictCode: d.ID,
+						})
+					}
 				}
+
 				prov.Cities = append(prov.Cities, city)
 			}
-			result = append(result, prov)
 		}
 
-		// 3. 输出目标 JSON 格式
-		out, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			fmt.Printf("目标 JSON 序列化失败: %v\n", err)
-			return
+		raw = append(raw, prov)
+	}
+
+	body, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("序列化原始 JSON 失败: %w", err)
+	}
+	return body, nil
+}
+
+func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizationKey string, cookies []*network.Cookie, gatewayHeaders map[string]string, url string) ([]areaNode, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range gatewayHeaders {
+		if value == "" {
+			continue
 		}
-		fmt.Println("=== 最终输出 ===")
-		fmt.Println(string(out))
-	*/
+		switch strings.ToLower(key) {
+		case "host", "content-length":
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("token", token)
+	req.Header.Set("Authorization", token)
+	if authorizationKey != "" {
+		req.Header.Set("authorization_key", authorizationKey)
+	}
+	if req.Header.Get("Cookie") == "" {
+		if cookieHeader := buildCookieHeader(cookies); cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		preview := string(body)
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, preview)
+	}
+
+	var result areaAPIResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		preview := string(body)
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		return nil, fmt.Errorf("接口响应解析失败: %w; 片段=%q", err, preview)
+	}
+
+	if isAreaAPIError(result) {
+		return nil, fmt.Errorf("接口返回异常 code=%d returnCode=%s msg=%s message=%s", result.Code, result.ReturnCode, result.Msg, result.Message)
+	}
+
+	return result.Data, nil
+}
+
+func findCookieValue(cookies []*network.Cookie, name string) string {
+	for _, cookie := range cookies {
+		if cookie != nil && cookie.Name == name {
+			return cookie.Value
+		}
+	}
+	return ""
+}
+
+func buildCookieHeader(cookies []*network.Cookie) string {
+	parts := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie == nil || cookie.Name == "" {
+			continue
+		}
+		value := sanitizeCookieValue(cookie.Value)
+		parts = append(parts, cookie.Name+"="+value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sanitizeCookieValue(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"`)
+	value = strings.ReplaceAll(value, "\n", "")
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, ";", "")
+	return value
+}
+
+func isAreaAPIError(result areaAPIResponse) bool {
+	if strings.EqualFold(result.ReturnCode, "FAILED") {
+		return true
+	}
+	if result.ReturnCode != "" && !strings.EqualFold(result.ReturnCode, "SUCCESS") {
+		return true
+	}
+	msg := strings.ToLower(result.Msg + " " + result.Message)
+	if strings.Contains(msg, "failed") || strings.Contains(msg, "error") {
+		return true
+	}
+	if len(result.Data) == 0 && strings.EqualFold(strings.TrimSpace(result.Msg), "Operate failed") {
+		return true
+	}
+	return false
 }
