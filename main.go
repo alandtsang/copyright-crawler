@@ -18,21 +18,21 @@ import (
 // ProvinceLoc 省份层级
 type ProvinceLoc struct {
 	Province     string     `json:"Province"`
-	ProvinceCode string     `json:"-"`
+	ProvinceCode string     `json:"ProvinceCode"`
 	Cities       []*CityLoc `json:"Cities"`
 }
 
 // CityLoc 城市层级
 type CityLoc struct {
 	City      string         `json:"City"`
-	CityCode  string         `json:"-"`
+	CityCode  string         `json:"CityCode"`
 	Districts []*DistrictLoc `json:"Districts"`
 }
 
 // DistrictLoc 区县层级
 type DistrictLoc struct {
 	District     string `json:"District"`
-	DistrictCode string `json:"-"`
+	DistrictCode string `json:"DistrictCode"`
 }
 
 type rawProvinceLoc struct {
@@ -330,13 +330,18 @@ func main() {
 		log.Fatalf("转换省市区数据失败: %v", err)
 	}
 
-	// 输出最终 JSON
+	// 将最终 JSON 写入项目根目录，避免大结果刷屏终端。
 	out, err := json.MarshalIndent(finalData, "", "  ")
 	if err != nil {
 		log.Fatalf("JSON 序列化失败: %v", err)
 	}
-	fmt.Println("\n=== 最终抓取的省市区数据 ===")
-	fmt.Println(string(out))
+	const outputFile = "output.json"
+	if err := os.WriteFile(outputFile, out, 0644); err != nil {
+		log.Fatalf("写入结果文件失败: %v", err)
+	}
+
+	fmt.Printf("结果已写入: %s\n", outputFile)
+	fmt.Printf("省份数量: %d\n", len(finalData))
 	fmt.Println("任务结束。")
 }
 
@@ -394,6 +399,7 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
+	const requestInterval = 200 * time.Millisecond
 	authorizationKey := strings.TrimSpace(gatewayHeaders["authorization_key"])
 	if authorizationKey == "" {
 		authorizationKey = strings.TrimSpace(gatewayHeaders["Authorization_Key"])
@@ -406,6 +412,7 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 	if err != nil {
 		return nil, fmt.Errorf("获取省份失败: %w", err)
 	}
+	time.Sleep(requestInterval)
 
 	raw := make([]rawProvinceLoc, 0, len(provinces))
 	for _, p := range provinces {
@@ -420,6 +427,7 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 			if err != nil {
 				return nil, fmt.Errorf("获取省份 %s(%s) 下城市失败: %w", p.Name, p.ID, err)
 			}
+			time.Sleep(requestInterval)
 
 			prov.Cities = make([]rawCityLoc, 0, len(cities))
 			for _, c := range cities {
@@ -434,6 +442,7 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 					if err != nil {
 						return nil, fmt.Errorf("获取城市 %s(%s) 下区县失败: %w", c.Name, c.ID, err)
 					}
+					time.Sleep(requestInterval)
 
 					city.Districts = make([]rawDistrictLoc, 0, len(districts))
 					for _, d := range districts {
@@ -459,68 +468,117 @@ func fetchAllAreaRawJSON(ctx context.Context, token string, cookies []*network.C
 }
 
 func fetchAreaNodes(ctx context.Context, client *http.Client, token, authorizationKey string, cookies []*network.Cookie, gatewayHeaders map[string]string, url string) ([]areaNode, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
+	const maxAttempts = 4
+	var lastErr error
 
-	for key, value := range gatewayHeaders {
-		if value == "" {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for key, value := range gatewayHeaders {
+			if value == "" {
+				continue
+			}
+			switch strings.ToLower(key) {
+			case "host", "content-length":
+				continue
+			}
+			req.Header.Set(key, value)
+		}
+
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("token", token)
+		req.Header.Set("Authorization", token)
+		if authorizationKey != "" {
+			req.Header.Set("authorization_key", authorizationKey)
+		}
+		if req.Header.Get("Cookie") == "" {
+			if cookieHeader := buildCookieHeader(cookies); cookieHeader != "" {
+				req.Header.Set("Cookie", cookieHeader)
+			}
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt == maxAttempts || !shouldRetryAreaRequest(0, err) {
+				return nil, err
+			}
+			waitBeforeRetry(ctx, attempt)
 			continue
 		}
-		switch strings.ToLower(key) {
-		case "host", "content-length":
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if attempt == maxAttempts || !shouldRetryAreaRequest(0, readErr) {
+				return nil, readErr
+			}
+			waitBeforeRetry(ctx, attempt)
 			continue
 		}
-		req.Header.Set(key, value)
-	}
 
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("token", token)
-	req.Header.Set("Authorization", token)
-	if authorizationKey != "" {
-		req.Header.Set("authorization_key", authorizationKey)
-	}
-	if req.Header.Get("Cookie") == "" {
-		if cookieHeader := buildCookieHeader(cookies); cookieHeader != "" {
-			req.Header.Set("Cookie", cookieHeader)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			preview := string(body)
+			if len(preview) > 300 {
+				preview = preview[:300] + "..."
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, preview)
+			if attempt == maxAttempts || !shouldRetryAreaRequest(resp.StatusCode, nil) {
+				return nil, lastErr
+			}
+			fmt.Printf("地区接口请求失败，准备重试(%d/%d): %s\n", attempt, maxAttempts, url)
+			waitBeforeRetry(ctx, attempt)
+			continue
 		}
+
+		var result areaAPIResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			preview := string(body)
+			if len(preview) > 300 {
+				preview = preview[:300] + "..."
+			}
+			return nil, fmt.Errorf("接口响应解析失败: %w; 片段=%q", err, preview)
+		}
+
+		if isAreaAPIError(result) {
+			return nil, fmt.Errorf("接口返回异常 code=%d returnCode=%s msg=%s message=%s", result.Code, result.ReturnCode, result.Msg, result.Message)
+		}
+
+		return result.Data, nil
 	}
 
-	resp, err := client.Do(req)
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("地区接口请求失败: %s", url)
+}
+
+func shouldRetryAreaRequest(statusCode int, err error) bool {
 	if err != nil {
-		return nil, err
+		return true
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	switch statusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
+}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		preview := string(body)
-		if len(preview) > 300 {
-			preview = preview[:300] + "..."
-		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, preview)
+func waitBeforeRetry(ctx context.Context, attempt int) {
+	delay := time.Duration(attempt) * time.Second
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
-
-	var result areaAPIResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		preview := string(body)
-		if len(preview) > 300 {
-			preview = preview[:300] + "..."
-		}
-		return nil, fmt.Errorf("接口响应解析失败: %w; 片段=%q", err, preview)
-	}
-
-	if isAreaAPIError(result) {
-		return nil, fmt.Errorf("接口返回异常 code=%d returnCode=%s msg=%s message=%s", result.Code, result.ReturnCode, result.Msg, result.Message)
-	}
-
-	return result.Data, nil
 }
 
 func findCookieValue(cookies []*network.Cookie, name string) string {
