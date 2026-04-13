@@ -220,14 +220,37 @@ func main() {
 		chromedp.Sleep(2*time.Second),
 
 		// 4. 软件名称与版本号
-		// 采用 XPath 查找包含对应文本的元素的最近一个 input
-		chromedp.WaitVisible(`//label[contains(text(), '软件')]/following::input[1] | //*[contains(text(), '软件名称')]/following::input[1]`, chromedp.BySearch),
-		chromedp.SendKeys(`//label[contains(text(), '软件')]/following::input[1] | //*[contains(text(), '软件名称')]/following::input[1]`, "测试测试", chromedp.BySearch),
-		chromedp.Sleep(500*time.Millisecond),
+		chromedp.ActionFunc(func(c context.Context) error {
+			fmt.Println("正在尝试查找并填写软件名称与版本号...")
+			waitCtx, cancelWait := context.WithTimeout(c, 5*time.Second)
+			defer cancelWait()
 
-		chromedp.WaitVisible(`//label[contains(text(), '版本')]/following::input[1] | //*[contains(text(), '版本号')]/following::input[1]`, chromedp.BySearch),
-		chromedp.SendKeys(`//label[contains(text(), '版本')]/following::input[1] | //*[contains(text(), '版本号')]/following::input[1]`, "1.0.0", chromedp.BySearch),
-		chromedp.Sleep(500*time.Millisecond),
+			// 尝试等待并查找软件全称输入框 (基于新的 HTML 结构使用 placeholder 定位)
+			errSoft := chromedp.WaitVisible(`//input[@placeholder='请输入软件全称']`, chromedp.BySearch).Do(waitCtx)
+			if errSoft != nil {
+				fmt.Println("未找到原定的软件名称输入框，可能是页面结构已变更。正在导出页面 HTML 以供调试...")
+				var htmlContent string
+				if errHtml := chromedp.OuterHTML("html", &htmlContent, chromedp.ByQuery).Do(c); errHtml == nil {
+					os.WriteFile("debug_agent_page.html", []byte(htmlContent), 0644)
+					fmt.Println("已将当前页面保存至 debug_agent_page.html。请将此文件提供给 AI 以排查最新结构。")
+				}
+				// 此时跳过后续版本号的填写
+				return nil
+			}
+
+			// 如果找到了软件名称，则执行输入
+			chromedp.SendKeys(`//input[@placeholder='请输入软件全称']`, "测试测试", chromedp.BySearch).Do(c)
+			time.Sleep(500 * time.Millisecond)
+
+			// 查找并填写版本号 (基于新的 HTML 结构使用 placeholder 定位)
+			errVer := chromedp.WaitVisible(`//input[@placeholder='请输入版本号']`, chromedp.BySearch).Do(waitCtx)
+			if errVer == nil {
+				chromedp.SendKeys(`//input[@placeholder='请输入版本号']`, "1.0.0", chromedp.BySearch).Do(c)
+				time.Sleep(500 * time.Millisecond)
+			}
+
+			return nil
+		}),
 
 		// 点击 下一步
 		chromedp.Click(`//*[contains(text(), '下一步')]`, chromedp.BySearch),
